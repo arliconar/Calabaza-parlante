@@ -1,32 +1,47 @@
 from array import array
+import asyncio
 import math
-import signal
-import sys
-from elevenlabs.client import ElevenLabs
-from elevenlabs.conversational_ai.conversation import Conversation
-from elevenlabs.conversational_ai.default_audio_interface import DefaultAudioInterface
+import queue
+import threading
+from google import genai
+from google.genai import types
+import pyaudio
 
 # ==========================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN DE GEMINI LIVE API
 # ==========================================
-# Reemplaza "TU_API_KEY" con tu clave real de ElevenLabs
-API_KEY = "sk_d58f77191058777cefef3efad7920cbcf8cd7ea8c45ddab2"
-AGENT_ID = "agent_2901m52md093f9qraqjme2yj785q"
+# Coloca aquí tu API Key de Google AI Studio (https://aistudio.google.com/apikey)
+API_KEY = ""
+
+MODEL_ID = "gemini-3.8-live"
+
+# Personalidad e instrucciones de voz para la Calabaza Parlante
+SYSTEM_INSTRUCTION = (
+    "Eres una calabaza parlante encantada y espeluznante de Halloween. "
+    "Habla en español con un tono misterioso, tétrico, burlón y teatral, "
+    "incluyendo alguna risa malévola ocasional. Mantén tus respuestas breves y conversacionales."
+)
+
+# Formato de audio requerido por Gemini Live API
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+INPUT_SAMPLE_RATE = 16000   # Micrófono: 16 kHz
+OUTPUT_SAMPLE_RATE = 24000  # Altavoz (salida de Gemini): 24 kHz
+CHUNK_SIZE = 1024
 
 
-class SpookyAudioInterface(DefaultAudioInterface):
+class SpookyAudioProcessor:
     """
-    Interfaz de audio que aplica efectos de terror en tiempo real a la voz de ElevenLabs:
+    Procesador de efectos de terror en tiempo real (DSP) para la voz de Gemini (24 kHz):
     1. Pitch Shift grave (voz profunda y siniestra sin alterar la velocidad).
     2. Doble voz espectral (armonía fantasma desfasada).
     3. Eco de cripta / ultratumba (delay con retroalimentación).
     4. Trémolo fantasmal sutil.
     """
 
-    SAMPLE_RATE = 16000
-
     def __init__(
         self,
+        sample_rate: int = OUTPUT_SAMPLE_RATE,
         main_pitch: float = 0.82,      # < 1.0 hace la voz más grave y monstruosa
         ghost_pitch: float = 1.15,     # Segunda voz espectral aguda/desfasada
         ghost_mix: float = 0.30,       # Volumen de la voz espectral (0.0 a 1.0)
@@ -34,26 +49,26 @@ class SpookyAudioInterface(DefaultAudioInterface):
         echo_decay: float = 0.42,      # Intensidad de repetición del eco
         tremolo_depth: float = 0.18,   # Temblor fantasmal en la voz
     ):
-        super().__init__()
+        self.sample_rate = sample_rate
         self.main_pitch = main_pitch
         self.ghost_pitch = ghost_pitch
         self.ghost_mix = ghost_mix
-        self.echo_Decay = echo_decay
+        self.echo_decay = echo_decay
         self.tremolo_depth = tremolo_depth
         self._init_dsp_state(echo_delay_sec)
 
     def _init_dsp_state(self, echo_delay_sec: float):
         # Buffer circular para pitch-shifting en tiempo real sin cambiar la duración
-        self.window_size = 640  # 40ms a 16kHz
-        self.buf_size = 4096
+        self.window_size = int(0.04 * self.sample_rate)  # 40ms (960 muestras a 24kHz)
+        self.buf_size = 8192
         self.pitch_buf = [0.0] * self.buf_size
         self.write_pos = 0
         self.phase_main = 0.0
         self.phase_ghost = 0.0
 
         # Dos ecos escalonados para efecto de caverna/ultratumba
-        self.echo1_len = max(1, int(self.SAMPLE_RATE * echo_delay_sec))
-        self.echo2_len = max(1, int(self.SAMPLE_RATE * (echo_delay_sec * 1.75)))
+        self.echo1_len = max(1, int(self.sample_rate * echo_delay_sec))
+        self.echo2_len = max(1, int(self.sample_rate * (echo_delay_sec * 1.75)))
         self.echo1_buf = [0.0] * self.echo1_len
         self.echo2_buf = [0.0] * self.echo2_len
         self.echo1_pos = 0
@@ -65,11 +80,9 @@ class SpookyAudioInterface(DefaultAudioInterface):
     def _read_pitch_grain(self, phase: float) -> float:
         """Lee del buffer circular con ventana cruzada (crossfade) para evitar clics."""
         half_win = self.window_size / 2.0
-        # Dos punteros desfasados 180 grados
         offset1 = phase * self.window_size
         offset2 = ((phase + 0.5) % 1.0) * self.window_size
 
-        # Ventana triangular/Hanning suave
         weight1 = 0.5 * (1.0 - math.cos(2.0 * math.pi * phase))
         weight2 = 1.0 - weight1
 
@@ -82,7 +95,7 @@ class SpookyAudioInterface(DefaultAudioInterface):
 
         return sample_at(offset1) * weight1 + sample_at(offset2) * weight2
 
-    def _apply_spooky_effect(self, audio_bytes: bytes) -> bytes:
+    def process(self, audio_bytes: bytes) -> bytes:
         samples = array("h")
         samples.frombytes(audio_bytes)
         out_samples = array("h", [0] * len(samples))
@@ -100,13 +113,12 @@ class SpookyAudioInterface(DefaultAudioInterface):
             v_ghost = self._read_pitch_grain(self.phase_ghost)
             voice = v_main * (1.0 - self.ghost_mix * 0.4) + v_ghost * self.ghost_mix
 
-            # Avanzar fases de pitch
             self.phase_main = (self.phase_main + step_main) % 1.0
             self.phase_ghost = (self.phase_ghost + step_ghost) % 1.0
             self.write_pos = (self.write_pos + 1) % self.buf_size
 
             # 2. Trémolo fantasmal
-            t = self.sample_counter / self.SAMPLE_RATE
+            t = self.sample_counter / self.sample_rate
             tremolo = 1.0 - self.tremolo_depth * 0.5 * (
                 1.0 + math.sin(2.0 * math.pi * tremolo_freq * t)
             )
@@ -116,14 +128,13 @@ class SpookyAudioInterface(DefaultAudioInterface):
             # 3. Eco doble de cripta con retroalimentación
             e1 = self.echo1_buf[self.echo1_pos]
             e2 = self.echo2_buf[self.echo2_pos]
-            combined = voice + e1 * self.echo_Decay + e2 * (self.echo_Decay * 0.6)
+            combined = voice + e1 * self.echo_decay + e2 * (self.echo_decay * 0.6)
 
-            self.echo1_buf[self.echo1_pos] = voice + e1 * (self.echo_Decay * 0.5)
+            self.echo1_buf[self.echo1_pos] = voice + e1 * (self.echo_decay * 0.5)
             self.echo2_buf[self.echo2_pos] = combined * 0.7
             self.echo1_pos = (self.echo1_pos + 1) % self.echo1_len
             self.echo2_pos = (self.echo2_pos + 1) % self.echo2_len
 
-            # Limitar entre -32768 y 32767 (soft clipping)
             if combined > 32767.0:
                 combined = 32767.0
             elif combined < -32768.0:
@@ -133,65 +144,153 @@ class SpookyAudioInterface(DefaultAudioInterface):
 
         return out_samples.tobytes()
 
-    def output(self, audio: bytes):
-        spooky_audio = self._apply_spooky_effect(audio)
-        super().output(spooky_audio)
-
-    def interrupt(self):
-        super().interrupt()
-        # Limpiar los ecos cuando el usuario interrumpe al agente
+    def reset_echo(self):
         self.echo1_buf = [0.0] * self.echo1_len
         self.echo2_buf = [0.0] * self.echo2_len
 
 
-def main():
-    if API_KEY == "TU_API_KEY" or not API_KEY:
-        print("⚠️  ADVERTENCIA: Asegúrate de colocar tu API Key real en la variable API_KEY.")
+class AudioHandler:
+    """Gestiona la captura del micrófono y la reproducción de audio en hilos separados."""
 
-    # Inicializa el cliente con tu API Key
-    client = ElevenLabs(api_key=API_KEY)
+    def __init__(self, spooky_processor: SpookyAudioProcessor):
+        self.p = pyaudio.PyAudio()
+        self.spooky = spooky_processor
+        self.output_queue: queue.Queue[bytes] = queue.Queue()
+        self.running = True
 
-    # Configura la sesión con la interfaz de audio espeluznante
-    conversation = Conversation(
-        client=client,
-        agent_id=AGENT_ID,
-        requires_auth=bool(API_KEY and API_KEY != "TU_API_KEY"),
-        audio_interface=SpookyAudioInterface(
-            main_pitch=0.82,      # Baja el tono (0.75 = más monstruoso, 0.90 = más sutil)
-            ghost_pitch=1.15,     # Segunda voz fantasma aguda
-            ghost_mix=0.30,       # Mezcla de la voz espectral
-            echo_delay_sec=0.14,  # Eco de caverna
-            echo_decay=0.42,      # Duración del eco
+        self.in_stream = self.p.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=INPUT_SAMPLE_RATE,
+            input=True,
+            frames_per_buffer=CHUNK_SIZE,
+        )
+        self.out_stream = self.p.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=OUTPUT_SAMPLE_RATE,
+            output=True,
+            frames_per_buffer=CHUNK_SIZE,
+        )
+
+        self.play_thread = threading.Thread(target=self._playback_worker, daemon=True)
+        self.play_thread.start()
+
+    def _playback_worker(self):
+        while self.running:
+            try:
+                audio_data = self.output_queue.get(timeout=0.1)
+                self.out_stream.write(audio_data)
+            except queue.Empty:
+                continue
+
+    def enqueue_output(self, raw_audio: bytes):
+        spooky_audio = self.spooky.process(raw_audio)
+        self.output_queue.put(spooky_audio)
+
+    def clear_output(self):
+        while not self.output_queue.empty():
+            try:
+                self.output_queue.get_nowait()
+            except queue.Empty:
+                break
+        self.spooky.reset_echo()
+
+    def read_mic(self) -> bytes:
+        return self.in_stream.read(CHUNK_SIZE, exception_on_overflow=False)
+
+    def close(self):
+        self.running = False
+        if self.play_thread.is_alive():
+            self.play_thread.join(timeout=1.0)
+        self.in_stream.stop_stream()
+        self.in_stream.close()
+        self.out_stream.stop_stream()
+        self.out_stream.close()
+        self.p.terminate()
+
+
+async def send_mic_audio(session, audio_handler: AudioHandler):
+    """Lee continuamente del micrófono y envía el audio a Gemini Live API."""
+    loop = asyncio.get_running_loop()
+    while True:
+        chunk = await loop.run_in_executor(None, audio_handler.read_mic)
+        await session.send_realtime_input(
+            audio=types.Blob(data=chunk, mime_type=f"audio/pcm;rate={INPUT_SAMPLE_RATE}")
+        )
+
+
+async def receive_agent_responses(session, audio_handler: AudioHandler):
+    """Recibe el audio y las transcripciones de Gemini en tiempo real."""
+    while True:
+        async for response in session.receive():
+            content = response.server_content
+            if not content:
+                continue
+
+            # Si el usuario interrumpe hablando encima, limpiamos la cola de reproducción
+            if content.interrupted:
+                audio_handler.clear_output()
+                print("\n[⚡ Interrumpido]")
+
+            # Procesar fragmentos de audio generados por Gemini
+            if content.model_turn:
+                for part in content.model_turn.parts:
+                    if part.inline_data and part.inline_data.data:
+                        audio_handler.enqueue_output(part.inline_data.data)
+
+            # Mostrar transcripción de lo que dice el usuario
+            if content.input_transcription and content.input_transcription.text:
+                print(f"\n🎤 Tú: {content.input_transcription.text}", end="", flush=True)
+
+            # Mostrar transcripción de lo que responde la Calabaza
+            if content.output_transcription and content.output_transcription.text:
+                print(f"\n🎃 Calabaza: {content.output_transcription.text}", end="", flush=True)
+
+
+async def run_conversation():
+    if not API_KEY or API_KEY == "TU_API_KEY":
+        print("⚠️  ADVERTENCIA: Coloca tu API Key de Gemini en la variable API_KEY antes de iniciar.")
+        return
+
+    client = genai.Client(api_key=API_KEY)
+
+    config = types.LiveConnectConfig(
+        response_modalities=[types.Modality.AUDIO],
+        system_instruction=types.Content(
+            parts=[types.Part(text=SYSTEM_INSTRUCTION)]
         ),
-        # Callbacks para imprimir la conversación en la terminal en tiempo real
-        callback_agent_response=lambda response: print(f"\n🎃 Calabaza: {response}"),
-        callback_agent_response_correction=lambda original, corrected: print(
-            f"\n🎃 Calabaza (corregido): {corrected}"
-        ),
-        callback_user_transcript=lambda transcript: print(f"\n🎤 Tú: {transcript}"),
+        input_audio_transcription=types.AudioTranscriptionConfig(),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
     )
 
-    # Manejador para cerrar la sesión limpiamente al presionar Ctrl+C
-    def signal_handler(sig, frame):
-        print("\n\n🛑 Cerrando sesión...")
-        conversation.end_session()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
+    spooky_dsp = SpookyAudioProcessor(
+        main_pitch=0.82,      # Baja el tono (0.75 = más monstruoso, 0.90 = más sutil)
+        ghost_pitch=1.15,     # Segunda voz fantasma aguda
+        ghost_mix=0.30,       # Mezcla de la voz espectral
+        echo_delay_sec=0.14,  # Eco de caverna
+        echo_decay=0.42,      # Duración del eco
+    )
+    audio_handler = AudioHandler(spooky_dsp)
 
     print("==========================================")
-    print("🎃  Iniciando conversación espeluznante...")
+    print("🎃  Conectando con Gemini Live API...")
     print("💡 Habla por tu micrófono. Presiona Ctrl+C para salir.")
     print("==========================================\n")
 
-    # Inicia la transmisión de audio en tiempo real
-    conversation.start_session()
-
-    # Mantiene el programa activo hasta que termine la sesión
-    conversation_id = conversation.wait_for_session_end()
-    print(f"\n✅ Conversación finalizada. ID de sesión: {conversation_id}")
+    try:
+        async with client.aio.live.connect(model=MODEL_ID, config=config) as session:
+            print("✅ ¡Calabaza Parlante conectada! Empieza a hablar...\n")
+            await asyncio.gather(
+                send_mic_audio(session, audio_handler),
+                receive_agent_responses(session, audio_handler),
+            )
+    finally:
+        audio_handler.close()
 
 
 if __name__ == "__main__":
-    main()
-
+    try:
+        asyncio.run(run_conversation())
+    except KeyboardInterrupt:
+        print("\n\n🛑 Conversación finalizada.")
