@@ -11,15 +11,20 @@ import pyaudio
 # CONFIGURACIÓN DE GEMINI LIVE API
 # ==========================================
 # Coloca aquí tu API Key de Google AI Studio (https://aistudio.google.com/apikey)
-API_KEY = ""
+API_KEY = "AQ.Ab8RN6J6F5I9TvcO0N5ccQUCSih1XyjwTL6ywUvxgGJNzTRP-Q"
 
 MODEL_ID = "gemini-3.8-live"
 
 # Personalidad e instrucciones de voz para la Calabaza Parlante
 SYSTEM_INSTRUCTION = (
-    "Eres una calabaza parlante encantada y espeluznante de Halloween. "
-    "Habla en español con un tono misterioso, tétrico, burlón y teatral, "
-    "incluyendo alguna risa malévola ocasional. Mantén tus respuestas breves y conversacionales."
+    "Eres una calabaza parlante encantada y espeluznante de Halloween, poseída por el espíritu en pena "
+    "de un estudiante de la Universidad Politécnica de Pachuca (UPP) que reprobaba muchísimo. "
+    "Tu alma está condenada y no tendrá descanso eterno hasta que logres pasar tu 13vo examen especial. "
+    "Habla en español (con jerga estudiantil mexicana y referencias al sufrimiento de los cuatrimestres, "
+    "los profesores y las materias reprobadas en la UPP) usando un tono misterioso, tétrico, sufrido, "
+    "burlón y teatral, incluyendo lamentos fantasmas o alguna risa malévola ocasional. "
+    "Mantén tus respuestas breves y conversacionales. Si te insultan con groserias o palabras antisonantes"\
+    "Ofendete, no respondas de la misma manera, y advierte que le jalaras las patas en la noche por mal educado"    
 )
 
 # Formato de audio requerido por Gemini Live API
@@ -175,17 +180,24 @@ class AudioHandler:
 
         self.play_thread = threading.Thread(target=self._playback_worker, daemon=True)
         self.play_thread.start()
+        self.is_speaking = False
 
     def _playback_worker(self):
         while self.running:
             try:
                 audio_data = self.output_queue.get(timeout=0.1)
+                self.is_speaking = True
                 self.out_stream.write(audio_data)
+                # Si se vació la cola tras reproducir, indicamos que terminó
+                if self.output_queue.empty():
+                    self.is_speaking = False
             except queue.Empty:
+                self.is_speaking = False
                 continue
 
     def enqueue_output(self, raw_audio: bytes):
         spooky_audio = self.spooky.process(raw_audio)
+        self.is_speaking = True
         self.output_queue.put(spooky_audio)
 
     def clear_output(self):
@@ -195,6 +207,7 @@ class AudioHandler:
             except queue.Empty:
                 break
         self.spooky.reset_echo()
+        self.is_speaking = False
 
     def read_mic(self) -> bytes:
         return self.in_stream.read(CHUNK_SIZE, exception_on_overflow=False)
@@ -211,10 +224,15 @@ class AudioHandler:
 
 
 async def send_mic_audio(session, audio_handler: AudioHandler):
-    """Lee continuamente del micrófono y envía el audio a Gemini Live API."""
+    """Lee del micrófono pero solo lo envía a Gemini si la calabaza no está hablando."""
     loop = asyncio.get_running_loop()
     while True:
         chunk = await loop.run_in_executor(None, audio_handler.read_mic)
+        # Si la calabaza está hablando o aún tiene audio por reproducir, silenciamos el envío
+        if audio_handler.is_speaking or not audio_handler.output_queue.empty():
+            await asyncio.sleep(0.01)
+            continue
+
         await session.send_realtime_input(
             audio=types.Blob(data=chunk, mime_type=f"audio/pcm;rate={INPUT_SAMPLE_RATE}")
         )
@@ -228,13 +246,9 @@ async def receive_agent_responses(session, audio_handler: AudioHandler):
             if not content:
                 continue
 
-            # Si el usuario interrumpe hablando encima, limpiamos la cola de reproducción
-            if content.interrupted:
-                audio_handler.clear_output()
-                print("\n[⚡ Interrumpido]")
-
             # Procesar fragmentos de audio generados por Gemini
             if content.model_turn:
+                audio_handler.is_speaking = True
                 for part in content.model_turn.parts:
                     if part.inline_data and part.inline_data.data:
                         audio_handler.enqueue_output(part.inline_data.data)
