@@ -1,3 +1,4 @@
 google-genai>=2.3.0
 pyaudio>=0.2.14
 gpiozero>=2.0
+rpi-lgpio>=0.6

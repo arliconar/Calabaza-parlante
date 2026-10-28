@@ -5,23 +5,18 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Usuario que ejecutará la calabaza (cambia 'pi' si tu usuario es diferente)
-User=pi
-Group=pi
+User=angel
+Group=angel
 
-# Variables de entorno para PulseAudio y Bluetooth del usuario
-Environment=HOME=/home/pi
+Environment=HOME=/home/angel
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
 
-# Ruta al script de arranque (ajusta si tu ruta es diferente)
-ExecStart=/bin/bash "/home/pi/Calabaza parlante/start_calabaza.sh"
+ExecStart=/bin/bash "/home/angel/Calabaza-parlante/start_calabaza.sh"
 
-# Si el proceso falla o se corta la conexión, reintentar tras 5 segundos
 Restart=on-failure
 RestartSec=5s
 
-# Asegurar que los logs se capturen en journalctl
 StandardOutput=journal
 StandardError=journal
 
