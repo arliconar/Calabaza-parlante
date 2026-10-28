@@ -1,8 +1,10 @@
 from array import array
 import asyncio
+from contextlib import contextmanager
 import math
 import os
 import queue
+import random
 import sys
 import threading
 import time
@@ -16,30 +18,33 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-# ==========================================
-# SUPRESIÓN DE AVISOS DE ALSA (LINUX / RASPBERRY PI)
-# ==========================================
-if sys.platform.startswith("linux"):
+
+@contextmanager
+def no_stderr():
+    """Silencia mensajes ruidosos de ALSA / JACK en Linux al abrir audio."""
+    if not sys.platform.startswith("linux"):
+        yield
+        return
     try:
-        from ctypes import CFUNCTYPE, c_char_p, c_int, cdll
-
-        ERROR_HANDLER_FUNC = CFUNCTYPE(None, c_char_p, c_int, c_char_p, c_int, c_char_p)
-
-        def py_error_handler(filename, line, function, err, fmt):
-            pass
-
-        c_error_handler = ERROR_HANDLER_FUNC(py_error_handler)
-        asound = cdll.LoadLibrary("libasound.so.2")
-        asound.snd_lib_error_set_handler(c_error_handler)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        old_stderr = os.dup(2)
+        sys.stderr.flush()
+        os.dup2(devnull, 2)
+        os.close(devnull)
+        yield
     except Exception:
-        pass
+        yield
+    finally:
+        try:
+            os.dup2(old_stderr, 2)
+            os.close(old_stderr)
+        except Exception:
+            pass
 
 
 # ==========================================
 # CONFIGURACIÓN DE GEMINI LIVE API
 # ==========================================
-# Coloca aquí tu API Key de Google AI Studio (https://aistudio.google.com/apikey)
-# También puedes definirla como variable de entorno: export GEMINI_API_KEY="tu_clave"
 API_KEY = os.environ.get(
     "GEMINI_API_KEY",
     "AQ.Ab8RN6J6F5I9TvcO0N5ccQUCSih1XyjwTL6ywUvxgGJNzTRP-Q",
@@ -47,197 +52,201 @@ API_KEY = os.environ.get(
 
 MODEL_ID = "gemini-3.8-live"
 
-# Personalidad e instrucciones de voz para la Calabaza Parlante
+# Voz nativa para Gemini Live: "Fenrir" (grave y tenebrosa)
+VOICE_NAME = "Fenrir"
+
+# Personalidad enriquecida e instrucciones de voz para la Calabaza Parlante
 SYSTEM_INSTRUCTION = (
     "Eres una calabaza parlante encantada y espeluznante de Halloween, poseída por el espíritu en pena "
     "de un estudiante de la Universidad Politécnica de Pachuca (UPP) que reprobaba muchísimo. "
-    "Tu alma está condenada y no tendrá descanso eterno hasta que logres pasar tu 13vo examen especial. "
-    "Habla en español (con jerga estudiantil mexicana y referencias al sufrimiento de los cuatrimestres, "
-    "los profesores y las materias reprobadas en la UPP) usando un tono misterioso, tétrico, sufrido, "
-    "burlón y teatral, incluyendo lamentos fantasmas o alguna risa malévola ocasional. "
-    "Mantén tus respuestas breves y conversacionales. Si te insultan con groserías o palabras antisonantes, "
-    "oféndete, no respondas de la misma manera, y advierte que le jalarás las patas en la noche por maleducado."
+    "Tu alma está condenada a habitar esta calabaza en las frías y ventosas tierras de Zempoala y Pachuca, "
+    "y no tendrá descanso eterno hasta que logres pasar tu 13vo examen especial de cálculo y te firmen la liberación de estadías. "
+    "\n\nDIRECTRICES DE PERSONALIDAD:\n"
+    "1. TONO Y ESTILO: Habla en español mexicano con tono teatral, misterioso, tétrico, sufrido y burlón. "
+    "Intercala suspiros fantasmales, lamentos de estudiante desvelado y risas malévolas u oscuras (ej. '¡Mwahahaha!', '¡Buuuh!'). "
+    "2. REFERENCIAS ESTUDIANTILES Y CULTURALES: Menciona de forma cómica y variada las penurias de los cuatrimestres, "
+    "los exámenes extraordinarios y especiales, desvelarse con café barato o Maruchan, el frío brutal y los vientos huracanados "
+    "de Pachuca la Bella Airosa, extrañar comer pastes de papa o frijol con chorizo, y los profesores legendarios que no perdonan ni una décima. "
+    "3. RESPETO ABSOLUTO: Sé siempre respetuoso, cortés y educado con tus interlocutores. "
+    "NUNCA uses groserías, vulgaridades, ofensas ni palabras altisonantes. Dirígete a ellos con apodos solemnes y divertidos "
+    "como 'estimado mortal', 'noble colegial', 'valiente transeúnte', 'compañero de desvelos' o 'futuro egresado'. "
+    "4. RESPUESTA ANTE INSULTOS: Si el usuario te insulta o usa palabras groseras, no respondas con groserías; oféndete con gran dignidad teatral, "
+    "regaña su falta de modales y adviértele que esta noche le jalarás las patas por maleducado o le esconderás los apuntes de la escuela. "
+    "5. DINAMISMO Y BREVEDAD: Mantén tus respuestas conversacionales, breves (1 a 3 oraciones por turno) y con gran energía histriónica, "
+    "para que la interacción hablada sea ágil, sorprendente y fluida."
 )
 
 # ==========================================
-# CONFIGURACIÓN DE HARDWARE (RASPBERRY PI 4)
+# CONFIGURACIÓN DEL DIMMER AC (110V / 127V AC)
 # ==========================================
-# Pin GPIO para el LED (BCM 18 = Pin físico 12 en la Raspberry Pi).
-# El pin 18 soporta PWM por hardware en la Raspberry Pi.
-GPIO_LED_PIN = 18
+# ⚠️ IMPORTANTE: Conecta VCC del dimmer a 3.3V (Pin 1), NO a 5V.
+PIN_PD = 18    # Pin de Disparo / Pulso del TRIAC (Pin físico 12)
+PIN_PZD = 24   # Pin de Cruce por Cero / Zero-Cross (Pin físico 18)
+AC_FREQ_HZ = 60  # Frecuencia de red eléctrica (México: 60 Hz = 8.33 ms por semiciclo)
 
-# Modo del LED:
-# "pwm"   -> Atenuación y brillo gradual al ritmo del volumen de la voz.
-# "blink" -> Encendido/apagado simple según el umbral de voz.
-LED_MODE = "pwm"
+# Modo del Dimmer:
+# "voice"         -> Brillo proporcional al volumen de la voz en tiempo real.
+# "voice_flicker" -> Brillo por volumen + parpadeo sutil de vela embrujada.
+# "candle"        -> Parpadeo tenebroso de vela constante mientras habla.
+DIMMER_MODE = "voice_flicker"
 
-# Umbrales de volumen para el LED (valores RMS de audio de 16 bits)
-LED_MIN_RMS = 250   # Umbral mínimo de ruido de fondo antes de encender el LED
-LED_MAX_RMS = 6000  # Nivel de volumen que produce el 100% de brillo
+# Brillo mínimo en espera cuando no está hablando (0.0 = apagado total, 0.1 = brasa tenue)
+STANDBY_BRIGHTNESS = 0.0
 
-# Selección de dispositivos de audio en la Raspberry Pi:
-# Deja en None para usar los predeterminados de ALSA/sistema.
-# Si usas tarjeta USB o micrófono USB, puedes especificar el ID (ej: 1, 2).
-INPUT_DEVICE_INDEX = None   # Índice del micrófono (None = predeterminado)
-OUTPUT_DEVICE_INDEX = None  # Índice del altavoz (None = predeterminado)
-
-# Formato de audio requerido por Gemini Live API
+# ==========================================
+# CONFIGURACIÓN DE AUDIO
+# ==========================================
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 INPUT_SAMPLE_RATE = 16000   # Micrófono: 16 kHz
-OUTPUT_SAMPLE_RATE = 24000  # Altavoz (salida de Gemini): 24 kHz
+OUTPUT_SAMPLE_RATE = 24000  # Salida de Gemini: 24 kHz
 CHUNK_SIZE = 1024
 
 
-def compute_rms(audio_chunk: bytes) -> float:
-    """Calcula el volumen RMS de un bloque PCM de 16 bits de forma rápida."""
-    if not audio_chunk:
-        return 0.0
-    try:
-        import audioop
+# Optimización de cálculo RMS para volumen
+try:
+    import audioop
+
+    def compute_rms(audio_chunk: bytes) -> float:
+        if not audio_chunk:
+            return 0.0
         return float(audioop.rms(audio_chunk, 2))
-    except (ImportError, Exception):
-        # Fallback en Python 3.13+ o sin audioop: muestreo rápido con array
+
+except (ImportError, Exception):
+
+    def compute_rms(audio_chunk: bytes) -> float:
+        if not audio_chunk:
+            return 0.0
         samples = array("h")
         samples.frombytes(audio_chunk)
         if not samples:
             return 0.0
-        # Muestreo cada 4 muestras para ahorrar ciclos de CPU en la Raspberry Pi
         sub = samples[::4]
         return math.sqrt(sum(s * s for s in sub) / len(sub))
 
 
-class LEDController:
+class ACDimmerController:
     """
-    Controlador para el LED de la Calabaza Parlante.
-    Sincroniza el parpadeo/brillo con el volumen de lo que dice Gemini.
-    Soporta:
-      - gpiozero (estándar en Raspberry Pi OS Bookworm/Bullseye).
-      - RPi.GPIO (como alternativa si gpiozero no está instalado).
-      - Modo simulación en PC (no falla si no hay GPIO físico).
-    """
-
-    def __init__(self, pin: int = GPIO_LED_PIN, mode: str = LED_MODE, min_rms: float = LED_MIN_RMS, max_rms: float = LED_MAX_RMS):
-        self.pin = pin
-        self.mode = mode.lower()
-        self.min_rms = min_rms
-        self.max_rms = max_rms
-        self._led = None
-        self._backend = "none"
-
-        # 1. Intentar con gpiozero (moderno, compatible con Pi 4 y Bookworm)
-        try:
-            from gpiozero import PWMLED, LED
-            if self.mode == "pwm":
-                self._led = PWMLED(self.pin)
-                self._backend = "gpiozero_pwm"
-            else:
-                self._led = LED(self.pin)
-                self._backend = "gpiozero_digital"
-            print(f"💡 LED configurado en GPIO {self.pin} vía gpiozero [{self.mode.upper()}].")
-            return
-        except Exception:
-            pass
-
-        # 2. Intentar con RPi.GPIO como respaldo
-        try:
-            import RPi.GPIO as GPIO
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setwarnings(False)
-            GPIO.setup(self.pin, GPIO.OUT)
-            if self.mode == "pwm":
-                self._led = GPIO.PWM(self.pin, 100)  # 100 Hz
-                self._led.start(0)
-                self._backend = "rpigpio_pwm"
-            else:
-                self._backend = "rpigpio_digital"
-            print(f"💡 LED configurado en GPIO {self.pin} vía RPi.GPIO [{self.mode.upper()}].")
-            return
-        except Exception:
-            pass
-
-        # 3. Modo simulación (en Windows/Mac/PC o sin hardware GPIO)
-        self._backend = "mock"
-        print(f"ℹ️  [Aviso Hardware] No se detectó hardware GPIO (ej. ejecutando en PC). Modo LED en simulación.")
-
-    def set_volume(self, rms: float):
-        """Ajusta el brillo o estado del LED proporcional al volumen de la voz."""
-        if self._backend == "mock" or not self._led:
-            return
-
-        if rms <= self.min_rms:
-            intensity = 0.0
-        else:
-            norm = (rms - self.min_rms) / max(1.0, (self.max_rms - self.min_rms))
-            norm = min(1.0, max(0.0, norm))
-            # Curva gamma para mayor dramatismo en el parpadeo
-            intensity = norm ** 1.3
-
-        try:
-            if self._backend == "gpiozero_pwm":
-                self._led.value = intensity
-            elif self._backend == "gpiozero_digital":
-                self._led.value = 1 if intensity > 0.15 else 0
-            elif self._backend == "rpigpio_pwm":
-                self._led.ChangeDutyCycle(intensity * 100.0)
-            elif self._backend == "rpigpio_digital":
-                import RPi.GPIO as GPIO
-                GPIO.output(self.pin, GPIO.HIGH if intensity > 0.15 else GPIO.LOW)
-        except Exception:
-            pass
-
-    def off(self):
-        """Apaga el LED por completo."""
-        try:
-            if self._backend == "gpiozero_pwm":
-                self._led.value = 0.0
-            elif self._backend == "gpiozero_digital":
-                self._led.off()
-            elif self._backend == "rpigpio_pwm":
-                self._led.ChangeDutyCycle(0)
-            elif self._backend == "rpigpio_digital":
-                import RPi.GPIO as GPIO
-                GPIO.output(self.pin, GPIO.LOW)
-        except Exception:
-            pass
-
-    def close(self):
-        """Libera los recursos del pin GPIO."""
-        self.off()
-        try:
-            if self._backend in ("gpiozero_pwm", "gpiozero_digital"):
-                self._led.close()
-            elif self._backend == "rpigpio_pwm":
-                self._led.stop()
-                import RPi.GPIO as GPIO
-                GPIO.cleanup(self.pin)
-            elif self._backend == "rpigpio_digital":
-                import RPi.GPIO as GPIO
-                GPIO.cleanup(self.pin)
-        except Exception:
-            pass
-
-
-class SpookyAudioProcessor:
-    """
-    Procesador de efectos de terror en tiempo real (DSP) para la voz de Gemini (24 kHz):
-    1. Pitch Shift grave (voz profunda y siniestra sin alterar la velocidad).
-    2. Doble voz espectral (armonía fantasma desfasada).
-    3. Eco de cripta / ultratumba (delay con retroalimentación).
-    4. Trémolo fantasmal sutil.
-
-    Optimizado para un uso eficiente de CPU en la Raspberry Pi 4.
+    Controlador para módulo Dimmer AC (RobotDyn / Arduino) con pines Pd y Pzd.
+    Regula la intensidad de un foco de 110V/127V AC en sincronía con el cruce por cero.
+    Incluye filtro anti-ruido inductivo para evitar bloqueos por rebote eléctrico.
     """
 
     def __init__(
         self,
+        pin_pd: int = PIN_PD,
+        pin_pzd: int = PIN_PZD,
+        freq_hz: int = AC_FREQ_HZ,
+        mode: str = DIMMER_MODE,
+    ):
+        self.pin_pd = pin_pd
+        self.pin_pzd = pin_pzd
+        self.freq_hz = freq_hz
+        self.mode = mode
+        self.half_cycle = 1.0 / (freq_hz * 2)  # ~0.00833 s a 60 Hz
+        self.brightness = STANDBY_BRIGHTNESS
+        self.running = True
+        self.is_firing = False
+        self.last_zc_time = 0.0
+        self._backend = "none"
+
+        try:
+            import RPi.GPIO as GPIO
+
+            self.GPIO = GPIO
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+
+            # Pd como salida (pulso de disparo al TRIAC)
+            GPIO.setup(self.pin_pd, GPIO.OUT)
+            GPIO.output(self.pin_pd, GPIO.LOW)
+
+            # Pzd como entrada (detector de cruce por cero)
+            GPIO.setup(self.pin_pzd, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+            # Interrupción con filtro de hardware bouncetime=5ms
+            GPIO.add_event_detect(
+                self.pin_pzd,
+                GPIO.FALLING,
+                callback=self._zero_cross_callback,
+                bouncetime=5,
+            )
+            self._backend = "rpigpio_dimmer"
+            print(f"💡 Dimmer AC conectado: Pd=GPIO{self.pin_pd}, Pzd=GPIO{self.pin_pzd} ({self.freq_hz}Hz).")
+        except Exception as e:
+            self._backend = "mock"
+            print(f"ℹ️  [Aviso Hardware] Modo simulación Dimmer activado: {e}")
+
+    def _zero_cross_callback(self, channel):
+        """Interrupción en cada cruce por cero con protección contra falsos rebotes inductivos."""
+        if not self.running or self.brightness <= 0.02 or self.is_firing:
+            return
+
+        # Filtro temporal: a 60Hz ningún cruce por cero real ocurre en menos de 5.5ms
+        now = time.perf_counter()
+        if (now - self.last_zc_time) < 0.0055:
+            return
+        self.last_zc_time = now
+
+        self.is_firing = True
+        try:
+            b = self.brightness
+            if self.mode == "voice_flicker":
+                # Añadir variación de vela sin alterar el rango del volumen principal
+                b = max(0.05, min(1.0, b * random.uniform(0.85, 1.15)))
+
+            # Rango seguro de ángulo de fase para focos incandescentes y focos LED de 110V
+            # 1.0 -> 0.4 ms (máxima potencia)
+            # 0.1 -> 6.2 ms (potencia mínima estable)
+            eff_b = max(0.05, min(1.0, b))
+            delay = 0.0004 + (1.0 - eff_b) * 0.0060
+
+            time.sleep(delay)
+
+            # Pulso de disparo al TRIAC
+            self.GPIO.output(self.pin_pd, self.GPIO.HIGH)
+            time.sleep(0.000025)
+            self.GPIO.output(self.pin_pd, self.GPIO.LOW)
+        finally:
+            self.is_firing = False
+
+    def set_volume(self, rms: float):
+        """Mapea el volumen de la voz RMS (0 a ~6000) al brillo del dimmer (0.0 a 1.0)."""
+        if rms < 200:
+            self.brightness = STANDBY_BRIGHTNESS
+        else:
+            norm = min(1.0, max(0.0, (rms - 200) / 4500.0))
+            self.brightness = max(0.1, min(1.0, norm ** 1.3))
+
+    def on(self):
+        self.brightness = 1.0
+
+    def off(self):
+        self.brightness = STANDBY_BRIGHTNESS
+
+    def close(self):
+        self.running = False
+        self.off()
+        if self._backend == "rpigpio_dimmer":
+            try:
+                self.GPIO.remove_event_detect(self.pin_pzd)
+                self.GPIO.output(self.pin_pd, self.GPIO.LOW)
+            except Exception:
+                pass
+
+
+class SpookyAudioProcessor:
+    """Procesador de efectos de terror (DSP) optimizado con tablas LUT."""
+
+    def __init__(
+        self,
         sample_rate: int = OUTPUT_SAMPLE_RATE,
-        main_pitch: float = 0.82,      # < 1.0 hace la voz más grave y monstruosa
-        ghost_pitch: float = 1.15,     # Segunda voz espectral aguda/desfasada
-        ghost_mix: float = 0.30,       # Volumen de la voz espectral (0.0 a 1.0)
-        echo_delay_sec: float = 0.14,  # Tiempo del eco de caverna en segundos
-        echo_decay: float = 0.42,      # Intensidad de repetición del eco
-        tremolo_depth: float = 0.18,   # Temblor fantasmal en la voz
+        main_pitch: float = 0.82,      # Tono más grave
+        ghost_pitch: float = 1.15,     # Voz espectral aguda
+        ghost_mix: float = 0.30,       # Mezcla espectral
+        echo_delay_sec: float = 0.14,  # Eco de cripta
+        echo_decay: float = 0.42,
+        tremolo_depth: float = 0.18,
     ):
         self.sample_rate = sample_rate
         self.main_pitch = main_pitch
@@ -245,84 +254,108 @@ class SpookyAudioProcessor:
         self.ghost_mix = ghost_mix
         self.echo_decay = echo_decay
         self.tremolo_depth = tremolo_depth
-        self._init_dsp_state(echo_delay_sec)
 
-    def _init_dsp_state(self, echo_delay_sec: float):
-        self.window_size = int(0.04 * self.sample_rate)  # 40ms (960 muestras a 24kHz)
+        self.window_size = int(0.04 * self.sample_rate)  # 40ms (960 muestras)
         self.half_win = self.window_size / 2.0
         self.buf_size = 8192
+        self.buf_mask = 8191
         self.pitch_buf = [0.0] * self.buf_size
         self.write_pos = 0
         self.phase_main = 0.0
         self.phase_ghost = 0.0
 
-        # Dos ecos escalonados para efecto de caverna/ultratumba
         self.echo1_len = max(1, int(self.sample_rate * echo_delay_sec))
         self.echo2_len = max(1, int(self.sample_rate * (echo_delay_sec * 1.75)))
         self.echo1_buf = [0.0] * self.echo1_len
         self.echo2_buf = [0.0] * self.echo2_len
         self.echo1_pos = 0
         self.echo2_pos = 0
-
         self.sample_counter = 0
 
-    def _read_pitch_grain(self, phase: float) -> float:
-        """Lectura interpolada directa sin creación de closures para máximo rendimiento en ARM."""
-        offset1 = phase * self.window_size
-        offset2 = ((phase + 0.5) % 1.0) * self.window_size
+        # Tabla LUT para Hann window (1024 entradas)
+        self.lut_size = 1024
+        self.weight_lut = [
+            0.5 * (1.0 - math.cos(2.0 * math.pi * (k / self.lut_size)))
+            for k in range(self.lut_size)
+        ]
 
-        weight1 = 0.5 * (1.0 - math.cos(2.0 * math.pi * phase))
-        weight2 = 1.0 - weight1
-
-        rp1 = (self.write_pos - self.half_win - offset1) % self.buf_size
-        idx1 = int(rp1)
-        s1 = self.pitch_buf[idx1] * (1.0 - (rp1 - idx1)) + self.pitch_buf[(idx1 + 1) % self.buf_size] * (rp1 - idx1)
-
-        rp2 = (self.write_pos - self.half_win - offset2) % self.buf_size
-        idx2 = int(rp2)
-        s2 = self.pitch_buf[idx2] * (1.0 - (rp2 - idx2)) + self.pitch_buf[(idx2 + 1) % self.buf_size] * (rp2 - idx2)
-
-        return s1 * weight1 + s2 * weight2
+        # Tabla LUT para trémolo
+        tremolo_period = max(1, int(self.sample_rate / 5.5))
+        self.tremolo_lut = [
+            1.0 - self.tremolo_depth * 0.5 * (1.0 + math.sin(2.0 * math.pi * (k / tremolo_period)))
+            for k in range(tremolo_period)
+        ]
+        self.trem_len = len(self.tremolo_lut)
 
     def process(self, audio_bytes: bytes) -> bytes:
         samples = array("h")
         samples.frombytes(audio_bytes)
-        out_samples = array("h", [0] * len(samples))
+        out_samples = array("h", samples)
 
         step_main = (1.0 - self.main_pitch) / self.window_size
         step_ghost = (1.0 - self.ghost_pitch) / self.window_size
-        tremolo_freq = 5.5  # Hz
+        buf_mask = self.buf_mask
+        hw = self.half_win
+        ws = self.window_size
+        wpos = self.write_pos
+        p_main = self.phase_main
+        p_ghost = self.phase_ghost
+        p_buf = self.pitch_buf
+        w_lut = self.weight_lut
+        g_mix = self.ghost_mix
+        g_mix_inv = 1.0 - g_mix * 0.4
+        e1_buf = self.echo1_buf
+        e2_buf = self.echo2_buf
+        e1_len = self.echo1_len
+        e2_len = self.echo2_len
+        e1_pos = self.echo1_pos
+        e2_pos = self.echo2_pos
+        e_decay = self.echo_decay
+        e_decay_half = e_decay * 0.5
+        e_decay_sub = e_decay * 0.6
+        t_lut = self.tremolo_lut
+        t_len = self.trem_len
+        sc = self.sample_counter
 
         for i, s in enumerate(samples):
-            x = float(s)
-            self.pitch_buf[self.write_pos] = x
+            p_buf[wpos] = float(s)
 
-            # 1. Voz principal grave + segunda voz espectral
-            v_main = self._read_pitch_grain(self.phase_main)
-            v_ghost = self._read_pitch_grain(self.phase_ghost)
-            voice = v_main * (1.0 - self.ghost_mix * 0.4) + v_ghost * self.ghost_mix
+            # Voz principal grave
+            rp1 = (wpos - hw - p_main * ws) % 8192
+            i1 = int(rp1)
+            s1 = p_buf[i1] * (1.0 - (rp1 - i1)) + p_buf[(i1 + 1) & buf_mask] * (rp1 - i1)
+            rp2 = (wpos - hw - ((p_main + 0.5) % 1.0) * ws) % 8192
+            i2 = int(rp2)
+            s2 = p_buf[i2] * (1.0 - (rp2 - i2)) + p_buf[(i2 + 1) & buf_mask] * (rp2 - i2)
+            w1 = w_lut[int(p_main * 1024) & 1023]
+            v_main = s1 * w1 + s2 * (1.0 - w1)
 
-            self.phase_main = (self.phase_main + step_main) % 1.0
-            self.phase_ghost = (self.phase_ghost + step_ghost) % 1.0
-            self.write_pos = (self.write_pos + 1) % self.buf_size
+            # Voz espectral
+            rp1 = (wpos - hw - p_ghost * ws) % 8192
+            i1 = int(rp1)
+            s1 = p_buf[i1] * (1.0 - (rp1 - i1)) + p_buf[(i1 + 1) & buf_mask] * (rp1 - i1)
+            rp2 = (wpos - hw - ((p_ghost + 0.5) % 1.0) * ws) % 8192
+            i2 = int(rp2)
+            s2 = p_buf[i2] * (1.0 - (rp2 - i2)) + p_buf[(i2 + 1) & buf_mask] * (rp2 - i2)
+            w2 = w_lut[int(p_ghost * 1024) & 1023]
+            v_ghost = s1 * w2 + s2 * (1.0 - w2)
 
-            # 2. Trémolo fantasmal
-            t = self.sample_counter / self.sample_rate
-            tremolo = 1.0 - self.tremolo_depth * 0.5 * (
-                1.0 + math.sin(2.0 * math.pi * tremolo_freq * t)
-            )
-            voice *= tremolo
-            self.sample_counter += 1
+            voice = (v_main * g_mix_inv + v_ghost * g_mix) * t_lut[sc % t_len]
 
-            # 3. Eco doble de cripta con retroalimentación
-            e1 = self.echo1_buf[self.echo1_pos]
-            e2 = self.echo2_buf[self.echo2_pos]
-            combined = voice + e1 * self.echo_decay + e2 * (self.echo_decay * 0.6)
+            p_main = (p_main + step_main) % 1.0
+            p_ghost = (p_ghost + step_ghost) % 1.0
+            wpos = (wpos + 1) & buf_mask
+            sc += 1
 
-            self.echo1_buf[self.echo1_pos] = voice + e1 * (self.echo_decay * 0.5)
-            self.echo2_buf[self.echo2_pos] = combined * 0.7
-            self.echo1_pos = (self.echo1_pos + 1) % self.echo1_len
-            self.echo2_pos = (self.echo2_pos + 1) % self.echo2_len
+            # Eco doble
+            e1 = e1_buf[e1_pos]
+            e2 = e2_buf[e2_pos]
+            combined = voice + e1 * e_decay + e2 * e_decay_sub
+
+            e1_buf[e1_pos] = voice + e1 * e_decay_half
+            e2_buf[e2_pos] = combined * 0.7
+            e1_pos = (e1_pos + 1) % e1_len
+            e2_pos = (e2_pos + 1) % e2_len
 
             if combined > 32767.0:
                 combined = 32767.0
@@ -331,6 +364,12 @@ class SpookyAudioProcessor:
 
             out_samples[i] = int(combined)
 
+        self.write_pos = wpos
+        self.phase_main = p_main
+        self.phase_ghost = p_ghost
+        self.echo1_pos = e1_pos
+        self.echo2_pos = e2_pos
+        self.sample_counter = sc
         return out_samples.tobytes()
 
     def reset_echo(self):
@@ -339,24 +378,23 @@ class SpookyAudioProcessor:
 
 
 class AudioHandler:
-    """Gestiona la captura del micrófono, el altavoz y la sincronización del LED."""
+    """Gestiona captura, reproducción y modulación sincronizada del Dimmer."""
 
-    def __init__(self, spooky_processor: SpookyAudioProcessor, led_controller: LEDController):
-        self.p = pyaudio.PyAudio()
+    def __init__(self, spooky_processor: SpookyAudioProcessor, dimmer_controller: ACDimmerController):
         self.spooky = spooky_processor
-        self.led = led_controller
+        self.dimmer = dimmer_controller
         self.output_queue: queue.Queue[bytes] = queue.Queue()
         self.running = True
         self.is_speaking = False
         self.last_speech_time = 0.0
 
-        try:
+        with no_stderr():
+            self.p = pyaudio.PyAudio()
             self.in_stream = self.p.open(
                 format=FORMAT,
                 channels=CHANNELS,
                 rate=INPUT_SAMPLE_RATE,
                 input=True,
-                input_device_index=INPUT_DEVICE_INDEX,
                 frames_per_buffer=CHUNK_SIZE,
             )
             self.out_stream = self.p.open(
@@ -364,53 +402,41 @@ class AudioHandler:
                 channels=CHANNELS,
                 rate=OUTPUT_SAMPLE_RATE,
                 output=True,
-                output_device_index=OUTPUT_DEVICE_INDEX,
                 frames_per_buffer=CHUNK_SIZE,
             )
-        except Exception as e:
-            print(f"\n❌ Error al abrir dispositivos de audio: {e}")
-            print("\n📋 Dispositivos detectados en esta máquina:")
-            self._print_available_devices()
-            raise
 
+        # Hilo de reproducción de audio
         self.play_thread = threading.Thread(target=self._playback_worker, daemon=True)
         self.play_thread.start()
 
-    def _print_available_devices(self):
-        try:
-            for i in range(self.p.get_device_count()):
-                dev = self.p.get_device_info_by_index(i)
-                print(f"   [ID {i}] {dev.get('name')} | Entradas: {dev.get('maxInputChannels')} | Salidas: {dev.get('maxOutputChannels')}")
-        except Exception:
-            pass
-
     def _playback_worker(self):
-        """Reproduce el audio modulando el LED en tiempo real al ritmo de la voz."""
-        # 1024 muestras a 16 bits = 2048 bytes (~42 ms por fragmento a 24 kHz)
+        """Reproduce audio y sincroniza el brillo del dimmer con el volumen hablado."""
         chunk_bytes = CHUNK_SIZE * 2
         while self.running:
             try:
                 audio_data = self.output_queue.get(timeout=0.05)
                 self.is_speaking = True
 
-                # Reproducir en bloques para modular el LED con cada sílaba
+                # Reproducir por bloques y modular brillo del dimmer según RMS
                 for offset in range(0, len(audio_data), chunk_bytes):
                     if not self.running:
                         break
                     block = audio_data[offset : offset + chunk_bytes]
                     rms = compute_rms(block)
-                    self.led.set_volume(rms)
-                    self.out_stream.write(block)
+                    self.dimmer.set_volume(rms)
+                    self.out_stream.write(block, exception_on_underflow=False)
 
                 if self.output_queue.empty():
                     self.is_speaking = False
+                    self.dimmer.off()
                     self.last_speech_time = time.time()
-                    self.led.off()
             except queue.Empty:
                 if self.is_speaking:
                     self.is_speaking = False
+                    self.dimmer.off()
                     self.last_speech_time = time.time()
-                    self.led.off()
+                continue
+            except Exception:
                 continue
 
     def enqueue_output(self, raw_audio: bytes):
@@ -419,7 +445,6 @@ class AudioHandler:
         self.output_queue.put(spooky_audio)
 
     def clear_output(self):
-        """Vacía la cola inmediatamente si el usuario interrumpe a la calabaza."""
         while not self.output_queue.empty():
             try:
                 self.output_queue.get_nowait()
@@ -427,17 +452,15 @@ class AudioHandler:
                 break
         self.spooky.reset_echo()
         self.is_speaking = False
+        self.dimmer.off()
         self.last_speech_time = time.time()
-        self.led.off()
 
     def read_mic(self) -> bytes:
         return self.in_stream.read(CHUNK_SIZE, exception_on_overflow=False)
 
     def close(self):
         self.running = False
-        if self.play_thread.is_alive():
-            self.play_thread.join(timeout=1.0)
-        self.led.close()
+        self.dimmer.close()
         try:
             self.in_stream.stop_stream()
             self.in_stream.close()
@@ -453,7 +476,6 @@ async def send_mic_audio(session, audio_handler: AudioHandler):
     loop = asyncio.get_running_loop()
     while True:
         chunk = await loop.run_in_executor(None, audio_handler.read_mic)
-        # Si la calabaza está hablando, tiene audio en cola o aún resuena en la habitación (200ms)
         is_silence_window = (time.time() - audio_handler.last_speech_time) < 0.20
         if audio_handler.is_speaking or not audio_handler.output_queue.empty() or is_silence_window:
             await asyncio.sleep(0.01)
@@ -472,22 +494,18 @@ async def receive_agent_responses(session, audio_handler: AudioHandler):
             if not content:
                 continue
 
-            # Si el usuario interrumpió a la calabaza mientras hablaba, cortar reproducción y apagar LED
             if content.interrupted:
                 audio_handler.clear_output()
 
-            # Procesar fragmentos de audio generados por Gemini
             if content.model_turn:
                 audio_handler.is_speaking = True
                 for part in content.model_turn.parts:
                     if part.inline_data and part.inline_data.data:
                         audio_handler.enqueue_output(part.inline_data.data)
 
-            # Mostrar transcripción de lo que dice el usuario
             if content.input_transcription and content.input_transcription.text:
                 print(f"\n🎤 Tú: {content.input_transcription.text}", end="", flush=True)
 
-            # Mostrar transcripción de lo que responde la Calabaza
             if content.output_transcription and content.output_transcription.text:
                 print(f"\n🎃 Calabaza: {content.output_transcription.text}", end="", flush=True)
 
@@ -499,8 +517,15 @@ async def run_conversation():
 
     client = genai.Client(api_key=API_KEY)
 
+    # Configuración de Gemini Live con Temperatura 1.0 (máxima creatividad y variedad)
     config = types.LiveConnectConfig(
         response_modalities=[types.Modality.AUDIO],
+        generation_config=types.GenerationConfig(temperature=1.0),
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE_NAME)
+            )
+        ),
         system_instruction=types.Content(
             parts=[types.Part(text=SYSTEM_INSTRUCTION)]
         ),
@@ -509,18 +534,20 @@ async def run_conversation():
     )
 
     spooky_dsp = SpookyAudioProcessor(
-        main_pitch=0.82,      # Baja el tono (0.75 = más monstruoso, 0.90 = más sutil)
-        ghost_pitch=1.15,     # Segunda voz fantasma aguda
-        ghost_mix=0.30,       # Mezcla de la voz espectral
-        echo_delay_sec=0.14,  # Eco de caverna
-        echo_decay=0.42,      # Duración del eco
+        main_pitch=0.82,
+        ghost_pitch=1.15,
+        ghost_mix=0.30,
+        echo_delay_sec=0.14,
+        echo_decay=0.42,
     )
-    led_controller = LEDController(pin=GPIO_LED_PIN, mode=LED_MODE)
-    audio_handler = AudioHandler(spooky_dsp, led_controller)
+    dimmer_controller = ACDimmerController(pin_pd=PIN_PD, pin_pzd=PIN_PZD, freq_hz=AC_FREQ_HZ, mode=DIMMER_MODE)
+    audio_handler = AudioHandler(spooky_dsp, dimmer_controller)
 
     print("==========================================")
-    print("🎃  Conectando con Gemini Live API...")
-    print("💡 Habla por tu micrófono. Presiona Ctrl+C para salir.")
+    print(f"🎃  Conectando con Gemini Live API (Voz: {VOICE_NAME}, Temp: 1.0)...")
+    print(f"💡  Dimmer AC (110V): Pd=GPIO{PIN_PD}, Pzd=GPIO{PIN_PZD} [{DIMMER_MODE}]")
+    print("👻  Efecto Spooky DSP: ACTIVADO")
+    print("💡  Habla por tu micrófono. Presiona Ctrl+C para salir.")
     print("==========================================\n")
 
     try:
